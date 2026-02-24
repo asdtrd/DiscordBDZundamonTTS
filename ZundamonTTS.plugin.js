@@ -5,8 +5,21 @@
  * @license MIT
  */
 module.exports = class ZundamonTTS {
+    audioQueue = [];
+    isPlaying = false;
+    lastContext = null;
+    voiceVoxUsingIndex = 0;
+    usernameCache = "";
+
     start() {
-        this.settings = BdApi.Data.load("ZundamonTTS", "settings") ?? { useTranslation: true };
+        const defaultSettings = {
+            useTranslation: true,
+            useOllama: false,
+            ollamaModel: "gemma3:4b"
+        };
+        const savedSettings = BdApi.Data.load("ZundamonTTS", "settings") || {};
+        this.settings = { ...defaultSettings, ...savedSettings };
+
         this.MessageStore = BdApi.Webpack.getStore("MessageStore");
         this.SelectedChannelStore = BdApi.Webpack.getStore("SelectedChannelStore");
         this.UserStore = BdApi.Webpack.getStore("UserStore");
@@ -24,25 +37,56 @@ module.exports = class ZundamonTTS {
         if (this.MessageStore) {
             this.MessageStore.removeChangeListener(this.onChange);
         }
+        this.voiceVoxUsingIndex = 0;
     }
 
     getSettingsPanel() {
-    return BdApi.UI.buildSettingsPanel({
-        settings: [
-            {
-                type: "switch",
-                id: "useTranslation",
-                name: "일본어 번역 사용",
-                note: "켜짐: 한국어 뜻으로 번역 / 꺼짐: 한국어 발음 그대로(치환 테이블 사용)",
-                value: this.settings.useTranslation,
-                onChange: (val) => {
-                    this.settings.useTranslation = val;
-                    BdApi.Data.save("ZundamonTTS", "settings", this.settings);
+        return BdApi.UI.buildSettingsPanel({
+            onChange: (cid, sid, val) => {
+                this.settings[sid] = val;
+            },
+            settings: [
+                {
+                    type: "switch",
+                    id: "useTranslation",
+                    name: "일본어 번역 사용",
+                    note: "켜짐: 한국어 뜻으로 번역 / 꺼짐: 한국어 발음 그대로(치환 테이블 사용)",
+                    value: this.settings.useTranslation,
+                    onChange: (val) => {
+                        this.settings.useTranslation = val;
+                        BdApi.Data.save("ZundamonTTS", "settings", this.settings);
+                    }
+                },
+                {
+                    type: "switch",
+                    id: "useOllama",
+                    name: "Ollama 번역 사용",
+                    note: "Ollama 실행 필수!",
+                    value: this.settings.useOllama,
+                    onChange: (val) => {
+                        this.settings.useOllama = val;
+                        BdApi.Data.save("ZundamonTTS", "settings", this.settings);
+                    }
+                },
+                {
+                    type: "dropdown",
+                    id: "ollamaModel",
+                    name: "Ollama 모델 선택",
+                    note: "번역에 사용할 로컬 모델을 선택하세요. (PC 사양에 맞춰 선택)",
+                    value: this.settings.ollamaModel || "gemma3:4b", 
+                    options: [
+                        { label: "Gemma 3 12B (고사양/고품질)", value: "gemma3:12b" },
+                        { label: "Gemma 3 4B (중사양/권장)", value: "gemma3:4b" },
+                        { label: "Gemma 3 1B (저사양/광속)", value: "gemma3:1b" }
+                    ],
+                    onChange: (val) => {
+                        this.settings.ollamaModel = val;
+                        BdApi.Data.save("ZundamonTTS", "settings", this.settings);
+                    }
                 }
-            }
-        ]
-    });
-}
+            ]
+        });
+    }
 
     onChange() {
         const channel = this.SelectedChannelStore.getChannelId();
@@ -56,7 +100,7 @@ module.exports = class ZundamonTTS {
             const emojiRegex = /<(a?):(\w+):(\d+)>/g;
             const cleanText = msg.content.replace(emojiRegex, "いもじ");
             console.log("Invoke: "+msg.id)
-            this.speak(cleanText);
+            this.speak([msg.author.id, cleanText, msg.author.username]);
         }
         else if(msg && this.lastId !== msg.id){
             console.log("Event passed: " + msg.content);
@@ -64,35 +108,39 @@ module.exports = class ZundamonTTS {
     }
 
     async speak(text) {
-        const speakerId = 3; // 즌다몬 ID
+        this.audioQueue.push(text);
+        if (!this.isPlaying) {
+            this.processQueue();
+        }
+    }
+
+    async processQueue() {
+        if (this.audioQueue.length === 0) {
+            this.isPlaying = false;
+            return;
+        }
         const url = "http://localhost:50021";
 
+        this.isPlaying = true;
+        const msgData = this.audioQueue.shift(); // 큐의 맨 앞 텍스트 꺼내기
+        const text = msgData[1]; 
+        const voiceVoxId = this.getVoiceVoxIndex(msgData[0]);
+        this.usernameCache = msgData[2];
         try {
             // 1. 한국어 -> 일본어 번역 (Google Translate gtx API)
             // sl: source language (ko), tl: target language (ja)\
             var translatedText = ""
-            if(this.settings.useTranslation && text != "いもじ"){
-                const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl=ja&dt=t&q=${encodeURIComponent(text)}`;
-                
-                const resTranslate = await fetch(translateUrl);
-                const translateData = await resTranslate.json();
-                
-                // 결과 데이터 구조에서 첫 번째 번역 문구 추출
-                translatedText = translateData[0][0][0];
-                
-                console.log(`[즌다몬 번역] 원문: ${text} -> 일본어: ${translatedText}`);
-            }
-            else{
-                translatedText = this.applyReplaceTable(text);
-            }
+            translatedText = await this.translate(text);
+            console.log(translatedText);
+
             // 2. VOICEVOX 오디오 쿼리 생성 (번역된 텍스트 전달)
-            const resQuery = await BdApi.Net.fetch(`${url}/audio_query?text=${encodeURIComponent(translatedText)}&speaker=${speakerId}`, {
+            const resQuery = await BdApi.Net.fetch(`${url}/audio_query?text=${encodeURIComponent(translatedText)}&speaker=${voiceVoxId}`, {
                 method: "POST"
             });
             const queryJson = await resQuery.json();
 
             // 3. 음성 합성 (Synthesis)
-            const resAudio = await BdApi.Net.fetch(`${url}/synthesis?speaker=${speakerId}`, {
+            const resAudio = await BdApi.Net.fetch(`${url}/synthesis?speaker=${voiceVoxId}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(queryJson)
@@ -104,12 +152,91 @@ module.exports = class ZundamonTTS {
             const audio = new Audio(audioUrl);
             
             audio.play();
-            
-            // 메모리 관리를 위해 재생 후 URL 해제
-            audio.onended = () => URL.revokeObjectURL(audioUrl);
 
-        } catch (e) {
+            audio.onended = () => {
+                URL.revokeObjectURL(audio.src); // 메모리 해제
+                this.processQueue();
+            };
+        } 
+        catch (e) {
             console.error("즌다몬 TTS 처리 중 오류 발생:", e);
+            this.processQueue();
+        }
+    }
+
+    async translate(text){
+        var translatedText = ""
+        if(this.settings.useTranslation && text != "いもじ"){
+            if(this.settings.useOllama) translatedText = await this.translateWithOllama(text);
+            else translatedText = await this.translateGoogleTranslate(text);
+        }
+        else{
+            translatedText = this.applyReplaceTable(text);
+        }
+        return translatedText;
+    }
+
+    async translateGoogleTranslate(text){
+        const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl=ja&dt=t&q=${encodeURIComponent(text)}`;
+                
+        const resTranslate = await fetch(translateUrl);
+        const translateData = await resTranslate.json();
+        
+        const translatedText = translateData[0][0][0];
+        
+        console.log(`[즌다몬 번역] 원문: ${text} -> 일본어: ${translatedText}`);
+        return translatedText;
+    }
+
+    voiceVoxIndex = [
+        [3, 0],//즌다몬
+        [108, 0], //키리탄
+        [2, 0],//메탄
+        [8, 0],//카스카베
+        [10, 0]//하우
+    ];
+
+
+    getVoiceVoxIndex(userId){
+        var result = this.voiceVoxIndex.findIndex(row => row[1] === userId);
+        if(result === -1){
+            result = this.voiceVoxUsingIndex;
+            this.voiceVoxIndex[this.voiceVoxUsingIndex][1] = userId;
+            this.voiceVoxUsingIndex += 1;
+            if(this.voiceVoxUsingIndex >= this.voiceVoxIndex.length){
+                this.voiceVoxUsingIndex = 0;
+            }
+        }
+        return this.voiceVoxIndex[result][0];
+    }
+        
+    async translateWithOllama(text) {
+        const prompt = `Translate the following Korean text to natural Japanese.
+        Only output the translated Japanese text without any explanations.
+        Username: "${this.usernameCache}" Text: "${text}"`;
+        //TODO: 화자 지정, 모델에 따른 컨텍 조절, 답변일 시 프롬에 답변 추가, 성공 flag 반환
+
+        try {
+            const response = await BdApi.Net.fetch("http://localhost:11434/api/generate", {
+                method: "POST",
+                body: JSON.stringify({
+                    model: this.settings.ollamaModel,
+                    prompt: prompt,
+                    stream: false,
+                    keep_alive: "30m",
+                    context: this.lastContext
+                })
+            });
+            if (this.lastContext && this.lastContext.length > 1000) {
+                // 기억이 1000개를 넘어가면 앞쪽 500개를 버리고 최신 기억만 유지
+                this.lastContext = this.lastContext.slice(-500);
+            }
+            const data = await response.json();
+            this.lastContext = data.context;
+            return data.response.trim();
+        } catch (e) {
+            console.error("Ollama 번역 에러:", e);
+            return text; // 에러 시 원문 반환
         }
     }
 
